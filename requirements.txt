@@ -11,6 +11,9 @@ Pillow>=10.0.0
 google-generativeai>=0.7.0
 requests>=2.31.0
 
+# ═══ AI Thumbnail Generation (Gemini image model) ═══
+google-genai>=1.0.0
+
 # ═══ YouTube Upload ═══
 google-api-python-client>=2.100.0
 google-auth-oauthlib>=1.1.0

@@ -1,87 +1,101 @@
 """
 Ghibli-style thumbnail generator.
 Creates an eye-catching YouTube thumbnail for each story video using
-the Hugging Face Inference API with a Ghibli-style fine-tuned model.
-Overlays the story title text for maximum click-through appeal.
+Google's Gemini image model (gemini-2.5-flash-image, "Nano Banana") for
+top quality, driven by a detailed, story-accurate prompt. The Hindi
+title is added afterwards as a crisp PIL text overlay (image models
+render Hindi text unreliably). Falls back to the first scene image only
+if Gemini is unavailable.
 """
 import os
 import time
 import logging
-import requests
 from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
-from config import HUGGINGFACE_API_KEY, HF_GHIBLI_MODEL, VIDEO_WIDTH, VIDEO_HEIGHT
-from utils import logger, ensure_dir, sanitize_filename
-
-HF_INFERENCE_URL = "https://api-inference.huggingface.co/models/{model}"
-
-# Negative prompt to keep thumbnails clean and appealing
-THUMBNAIL_NEGATIVE_PROMPT = (
-    "nsfw, nude, explicit, gore, violence, blood, "
-    "blurry, low quality, distorted, deformed, "
-    "text, watermark, signature, ugly, bad anatomy"
+from config import (
+    GEMINI_API_KEY, GEMINI_IMAGE_MODEL, THUMB_WIDTH, THUMB_HEIGHT,
+    GHIBLI_STYLE, NEGATIVE_STYLE, VIDEO_WIDTH, VIDEO_HEIGHT,
 )
+from utils import logger, ensure_dir, sanitize_filename
 
 
 class ThumbnailGenerator:
-    """Generates Ghibli-style YouTube thumbnails with title overlay."""
+    """Generates Gemini-powered Ghibli-style YouTube thumbnails."""
 
-    def __init__(self, model_id: str = HF_GHIBLI_MODEL):
+    def __init__(self, model_id: str = GEMINI_IMAGE_MODEL):
         self.model_id = model_id
-        self.api_url = HF_INFERENCE_URL.format(model=model_id)
-        self.headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
-        self.max_retries = 4
-        self.retry_delay = 10
+        self.width = THUMB_WIDTH
+        self.height = THUMB_HEIGHT
+        self.max_retries = 3
+        self.retry_delay = 6
+        self._client = None
+
+    def _get_client(self):
+        """Lazily create the google-genai client (needs GEMINI_API_KEY)."""
+        if self._client is not None:
+            return self._client
+        if not GEMINI_API_KEY:
+            logger.error("  GEMINI_API_KEY not set — cannot generate thumbnail")
+            return None
+        try:
+            from google import genai
+            self._client = genai.Client(api_key=GEMINI_API_KEY)
+        except Exception as e:
+            logger.error(f"  Failed to init Gemini client: {e}")
+            self._client = None
+        return self._client
 
     def _query_api(self, prompt: str) -> Optional[bytes]:
-        """Send a text-to-image request to the HF Inference API."""
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "negative_prompt": THUMBNAIL_NEGATIVE_PROMPT,
-                "num_inference_steps": 35,
-                "guidance_scale": 8.0,
-                "width": 1280,
-                "height": 720,  # 16:9 YouTube thumbnail
-            },
-            "options": {"wait_for_model": True},
-        }
+        """
+        Generate a thumbnail image with Gemini.
+        Returns raw image bytes on success, None on failure.
+        """
+        client = self._get_client()
+        if client is None:
+            return None
+
+        try:
+            from google.genai import types
+        except Exception:
+            types = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = requests.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=120,
+                logger.info(
+                    f"  Gemini thumbnail request "
+                    f"(attempt {attempt}/{self.max_retries}, model={self.model_id})"
+                )
+                kwargs = {"model": self.model_id, "contents": prompt}
+                if types is not None:
+                    try:
+                        kwargs["config"] = types.GenerateContentConfig(
+                            response_modalities=["IMAGE"],
+                            image_config=types.ImageConfig(aspect_ratio="16:9"),
+                        )
+                    except Exception:
+                        pass  # older SDK: omit config, still returns an image
+
+                response = client.models.generate_content(**kwargs)
+
+                # Extract the first inline image part from the response
+                for cand in getattr(response, "candidates", None) or []:
+                    content = getattr(cand, "content", None)
+                    for part in getattr(content, "parts", None) or []:
+                        inline = getattr(part, "inline_data", None)
+                        if inline and getattr(inline, "data", None):
+                            return inline.data
+
+                logger.warning("  Gemini returned no image part")
+
+            except Exception as e:
+                logger.warning(
+                    f"  Gemini thumbnail failed (attempt {attempt}): {e}"
                 )
 
-                if response.status_code == 503:
-                    est = response.json().get("estimated_time", 20)
-                    logger.info(f"  Thumbnail model loading, waiting {est}s...")
-                    time.sleep(max(est, self.retry_delay))
-                    continue
+            time.sleep(self.retry_delay)
 
-                if response.status_code == 429:
-                    wait = int(response.headers.get("Retry-After", self.retry_delay))
-                    logger.warning(f"  Rate limited, waiting {wait}s")
-                    time.sleep(wait)
-                    continue
-
-                if response.status_code == 200:
-                    return response.content
-
-                logger.error(
-                    f"  Thumbnail API error {response.status_code}: "
-                    f"{response.text[:200]}"
-                )
-                time.sleep(self.retry_delay)
-
-            except requests.RequestException as e:
-                logger.warning(f"  Thumbnail request failed (attempt {attempt}): {e}")
-                time.sleep(self.retry_delay)
-
+        logger.error("  All retries exhausted for Gemini thumbnail")
         return None
 
     def _add_title_overlay(
@@ -227,15 +241,25 @@ class ThumbnailGenerator:
         output_path = os.path.join(thumbnails_dir, "thumbnail.jpg")
         raw_path = os.path.join(thumbnails_dir, "ghibli_raw.png")
 
-        # Build a Ghibli-style prompt from the story summary
+        # Build a rich, story-accurate prompt for Gemini. We ask for a
+        # clean lower-third (for the title overlay) and NO in-image text.
         ghibli_prompt = (
-            f"Studio Ghibli style anime illustration, {story_summary}, "
-            f"beautiful soft lighting, lush nature, whimsical, "
-            f"hand-painted look, vibrant colors, cinematic composition, "
-            f"highly detailed, masterpiece quality"
+            f"{GHIBLI_STYLE}. "
+            f"Create a stunning, eye-catching, high-click-through YouTube "
+            f"thumbnail for a children's story video. "
+            f"Story scene to depict: {story_summary}. "
+            f"Show one clear, emotive main character as the focal point with an "
+            f"expressive face, set in a magical storybook atmosphere. Use rich, "
+            f"vibrant, saturated colors, dramatic soft cinematic lighting, strong "
+            f"depth and fine detail, and a bold professional 16:9 composition. "
+            f"Place the main subject toward one side and keep the lower-third area "
+            f"visually clean and uncluttered so a title can be added there later. "
+            f"Absolutely NO text, letters, words, numbers, captions, watermark or "
+            f"logo anywhere in the image. Keep it wholesome, child-friendly and "
+            f"non-violent. Avoid: {NEGATIVE_STYLE}."
         )
 
-        logger.info("Generating Ghibli-style thumbnail...")
+        logger.info(f"Generating Gemini Ghibli-style thumbnail ({self.model_id})...")
         image_bytes = self._query_api(ghibli_prompt)
 
         if image_bytes:

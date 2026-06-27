@@ -1,95 +1,86 @@
 """
-Cartoon-style image generation using the Hugging Face Inference API.
+Cartoon-style image generation using Pollinations.ai (free, no API key).
 Generates one illustration per scene based on the visual_prompt from
-the script. Includes retry logic, rate-limit handling, and a local
-fallback so the pipeline never deadlocks if the API is overloaded.
+the script, so visuals match the narration and change with the story.
+Includes retry logic and a local fallback so the pipeline never
+deadlocks if the service is temporarily unavailable.
 """
 import os
 import time
+import random
 import logging
 import requests
 from typing import Optional
+from urllib.parse import quote
 from PIL import Image, ImageFilter, ImageEnhance
 
-from config import HUGGINGFACE_API_KEY, HF_CARTOON_MODEL, OUTPUT_DIR
+from config import (
+    POLLINATIONS_BASE, IMAGE_MODEL, IMAGE_WIDTH, IMAGE_HEIGHT,
+    CARTOON_STYLE, NEGATIVE_STYLE, OUTPUT_DIR,
+)
 from utils import logger, ensure_dir, sanitize_filename
 
-# Hugging Face Inference API endpoint
-HF_INFERENCE_URL = "https://api-inference.huggingface.co/models/{model}"
-
 # Negative prompt to keep images child-safe and high quality
-NEGATIVE_PROMPT = (
-    "nsfw, nude, naked, explicit, gore, blood, violence, "
-    "realistic, photorealistic, photograph, 3d render, "
-    "blurry, low quality, distorted, deformed, ugly, "
-    "extra fingers, bad anatomy, watermark, text, signature"
-)
+NEGATIVE_PROMPT = NEGATIVE_STYLE
 
 
 class ImageGenerator:
-    """Generates cartoon-style scene illustrations via Hugging Face."""
+    """Generates cartoon-style scene illustrations via Pollinations.ai."""
 
-    def __init__(self, model_id: str = HF_CARTOON_MODEL):
+    def __init__(self, model_id: str = IMAGE_MODEL):
         self.model_id = model_id
-        self.api_url = HF_INFERENCE_URL.format(model=model_id)
-        self.headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+        self.width = IMAGE_WIDTH
+        self.height = IMAGE_HEIGHT
         self.max_retries = 4
-        self.retry_delay = 10  # seconds between retries
+        self.retry_delay = 8  # seconds between retries
 
     def _query_api(self, prompt: str) -> Optional[bytes]:
         """
-        Send a text-to-image request to the HF Inference API.
+        Request a text-to-image generation from Pollinations.ai.
         Returns raw image bytes on success, None on failure.
+
+        Pollinations is a simple GET endpoint that returns the image
+        bytes directly. No API key required.
         """
-        payload = {
-            "inputs": prompt,
-            "parameters": {
-                "negative_prompt": NEGATIVE_PROMPT,
-                "num_inference_steps": 30,
-                "guidance_scale": 7.5,
-                "width": 1024,
-                "height": 576,  # 16:9 aspect ratio for video
-            },
-            "options": {"wait_for_model": True},
+        encoded = quote(prompt, safe="")
+        url = f"{POLLINATIONS_BASE}/{encoded}"
+        params = {
+            "model": self.model_id,
+            "width": self.width,
+            "height": self.height,
+            "nologo": "true",
+            "enhance": "true",
+            "negative": NEGATIVE_PROMPT,
+            "seed": random.randint(1, 1_000_000),
         }
 
         for attempt in range(1, self.max_retries + 1):
             try:
                 logger.info(
-                    f"  HF image request (attempt {attempt}/{self.max_retries})"
+                    f"  Pollinations image request "
+                    f"(attempt {attempt}/{self.max_retries})"
                 )
-                response = requests.post(
-                    self.api_url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=90,
-                )
+                response = requests.get(url, params=params, timeout=120)
 
-                # Model loading — wait and retry
-                if response.status_code == 503:
-                    estimated_time = response.json().get("estimated_time", 20)
-                    logger.info(
-                        f"  Model loading, waiting {estimated_time}s..."
+                if response.status_code == 200 and response.content:
+                    ctype = response.headers.get("Content-Type", "")
+                    if "image" in ctype or len(response.content) > 5000:
+                        return response.content
+                    logger.warning(f"  Non-image response: {ctype}")
+
+                elif response.status_code in (429, 502, 503, 504):
+                    logger.warning(
+                        f"  Service busy ({response.status_code}), "
+                        f"waiting {self.retry_delay}s"
                     )
-                    time.sleep(max(estimated_time, self.retry_delay))
+                    time.sleep(self.retry_delay)
                     continue
-
-                # Rate limited
-                if response.status_code == 429:
-                    retry_after = int(
-                        response.headers.get("Retry-After", self.retry_delay)
+                else:
+                    logger.error(
+                        f"  Pollinations error {response.status_code}: "
+                        f"{response.text[:150]}"
                     )
-                    logger.warning(f"  Rate limited, waiting {retry_after}s")
-                    time.sleep(retry_after)
-                    continue
 
-                if response.status_code == 200:
-                    return response.content
-
-                logger.error(
-                    f"  HF API error {response.status_code}: "
-                    f"{response.text[:200]}"
-                )
                 time.sleep(self.retry_delay)
 
             except requests.exceptions.Timeout:
@@ -214,11 +205,9 @@ class ImageGenerator:
         ensure_dir(job_dir)
         image_path = os.path.join(job_dir, f"scene_{scene_index:03d}.png")
 
-        # Prepend style keywords to enforce cartoon look
-        full_prompt = (
-            f"cartoon style, children's book illustration, vibrant colors, "
-            f"soft shading, friendly characters, {visual_prompt}"
-        )
+        # Prepend style keywords to enforce a consistent cartoon look.
+        # visual_prompt comes from the script, so each image matches the scene.
+        full_prompt = f"{CARTOON_STYLE}, {visual_prompt}"
 
         image_bytes = self._query_api(full_prompt)
 
