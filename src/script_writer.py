@@ -15,7 +15,7 @@ import requests
 import google.generativeai as genai
 
 from config import (
-    GEMINI_API_KEY, TARGET_WORD_COUNT, STORY_LANGUAGE_NAME,
+    GEMINI_API_KEY, GEMINI_API_KEY_2, TARGET_WORD_COUNT, STORY_LANGUAGE_NAME,
     GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL,
 )
 from utils import logger, extract_json_from_response, validate_content_safety
@@ -27,6 +27,7 @@ class ScriptWriter:
     """Generates AI-created Hindi story scripts via Gemini API."""
 
     def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
+        self.model_name = model_name
         self.model = genai.GenerativeModel(model_name)
         self.generation_config = genai.GenerationConfig(
             temperature=0.9,
@@ -34,6 +35,8 @@ class ScriptWriter:
             max_output_tokens=8192,
         )
         self.max_retries = 5
+        # Both Gemini keys (different free projects) → double the free quota.
+        self.gemini_keys = [k for k in [GEMINI_API_KEY, GEMINI_API_KEY_2] if k]
 
     def _generate_with_retry(self, prompt: str) -> str:
         """
@@ -46,60 +49,66 @@ class ScriptWriter:
         """
         last_error = None
 
-        # No key (or obviously wrong) → don't bother hitting Gemini,
-        # which would throw a confusing OAuth error. Go straight to Groq.
-        if not GEMINI_API_KEY:
-            logger.warning(
-                "  GEMINI_API_KEY not set — skipping Gemini, using Groq"
-            )
+        # Try each Gemini key in turn. A quota-exhausted key is skipped
+        # immediately (no waiting) and we move to the next key, then Groq.
+        if not self.gemini_keys:
+            logger.warning("  No Gemini key set — using Groq directly")
         else:
-            for attempt in range(1, self.max_retries + 1):
+            for ki, key in enumerate(self.gemini_keys):
+                label = "primary" if ki == 0 else f"Gemini-key#{ki + 1}"
                 try:
-                    response = self.model.generate_content(
-                        prompt,
-                        generation_config=self.generation_config,
-                    )
-                    return response.text
-
+                    genai.configure(api_key=key)
+                    model = genai.GenerativeModel(self.model_name)
                 except Exception as e:
-                    error_str = str(e)
+                    logger.error(f"  {label} init failed: {e}")
                     last_error = e
+                    continue
 
-                    # Rate limit / quota exhausted → go straight to Groq
-                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                        logger.warning(
-                            "  Gemini rate-limited/quota exhausted — "
-                            "switching to free Groq fallback (no wait)"
+                for attempt in range(1, 3):  # short retries per key
+                    try:
+                        response = model.generate_content(
+                            prompt,
+                            generation_config=self.generation_config,
                         )
-                        break
+                        return response.text
 
-                    # Auth/key problem → clear message, then Groq
-                    elif any(k in error_str for k in (
-                        "401", "403", "UNAUTHENTICATED", "PERMISSION_DENIED",
-                        "ACCESS_TOKEN_TYPE_UNSUPPORTED", "API_KEY_INVALID",
-                        "API key not valid",
-                    )):
-                        logger.error(
-                            "  Gemini AUTH failed — check the GEMINI_API_KEY "
-                            "secret (a valid key starts with 'AIza'). "
-                            "Falling back to Groq."
-                        )
-                        break
+                    except Exception as e:
+                        error_str = str(e)
+                        last_error = e
 
-                    # Temporary overload → short retry, then fall back
-                    elif "503" in error_str or "UNAVAILABLE" in error_str:
-                        wait_time = 5 * attempt
-                        logger.warning(
-                            f"  Gemini overloaded (attempt {attempt}/{self.max_retries}), "
-                            f"waiting {wait_time}s..."
-                        )
-                        time.sleep(wait_time)
-                        continue
+                        # Quota exhausted → next key (or Groq)
+                        if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                            logger.warning(
+                                f"  {label} quota exhausted — trying next key/Groq"
+                            )
+                            break
 
-                    # Any other error → try Groq instead of crashing
-                    else:
-                        logger.error(f"  Gemini API error: {error_str[:300]}")
-                        break
+                        # Auth/key problem → clear message, next key
+                        elif any(k in error_str for k in (
+                            "401", "403", "UNAUTHENTICATED", "PERMISSION_DENIED",
+                            "ACCESS_TOKEN_TYPE_UNSUPPORTED", "API_KEY_INVALID",
+                            "API key not valid",
+                        )):
+                            logger.error(
+                                f"  {label} AUTH failed — check this key "
+                                f"(a valid key starts with 'AIza')."
+                            )
+                            break
+
+                        # Temporary overload → short retry
+                        elif "503" in error_str or "UNAVAILABLE" in error_str:
+                            wait_time = 5 * attempt
+                            logger.warning(
+                                f"  {label} overloaded (attempt {attempt}/2), "
+                                f"waiting {wait_time}s..."
+                            )
+                            time.sleep(wait_time)
+                            continue
+
+                        # Any other error → next key / Groq
+                        else:
+                            logger.error(f"  {label} error: {error_str[:300]}")
+                            break
 
         # ── Fallback: free Groq LLM ──
         groq_text = self._generate_with_groq(prompt)
@@ -107,7 +116,7 @@ class ScriptWriter:
             return groq_text
 
         raise RuntimeError(
-            f"Both Gemini and Groq failed. Last Gemini error: {last_error}"
+            f"All Gemini keys and Groq failed. Last error: {last_error}"
         )
 
     def _generate_with_groq(self, prompt: str, max_tokens: int = 4096) -> str:
@@ -131,6 +140,7 @@ class ScriptWriter:
             "Content-Type": "application/json",
         }
 
+        use_json = True  # force strict JSON output; drop if model rejects it
         for attempt in range(1, 6):
             payload = {
                 "model": GROQ_MODEL,
@@ -139,7 +149,8 @@ class ScriptWriter:
                         "role": "system",
                         "content": (
                             "तुम एक उस्ताद कहानीकार (master storyteller) हो जो "
-                            "केवल valid JSON में जवाब देता है, कोई extra text नहीं।"
+                            "केवल valid JSON object में जवाब देता है, कोई extra "
+                            "text, markdown या ``` नहीं।"
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -148,10 +159,13 @@ class ScriptWriter:
                 "top_p": 0.95,
                 "max_tokens": max_tokens,
             }
+            if use_json:
+                payload["response_format"] = {"type": "json_object"}
             try:
                 logger.info(
                     f"  Groq fallback request "
-                    f"(model={GROQ_MODEL}, max_tokens={max_tokens}, attempt {attempt})"
+                    f"(model={GROQ_MODEL}, max_tokens={max_tokens}, "
+                    f"json={use_json}, attempt {attempt})"
                 )
                 r = requests.post(
                     GROQ_BASE_URL, headers=headers, json=payload, timeout=180
@@ -159,6 +173,14 @@ class ScriptWriter:
                 if r.status_code == 200:
                     data = r.json()
                     return data["choices"][0]["message"]["content"]
+
+                # Model doesn't support JSON mode → retry without it
+                elif r.status_code == 400 and use_json:
+                    logger.warning(
+                        "  Groq JSON mode unsupported — retrying in plain mode"
+                    )
+                    use_json = False
+                    continue
 
                 # Request too large for free TPM cap → shrink and retry
                 elif r.status_code == 413:
