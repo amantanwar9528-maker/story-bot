@@ -3,13 +3,13 @@ Story script generation using the Gemini API — fully in Hindi.
 The AI generates unique topics automatically, checking against
 previously published stories to never repeat.
 
-Pipeline:
-  1. generate_unique_topics() — asks Gemini for fresh Hindi topics
-  2. generate_script() — writes the full Hindi story with scenes
+Uses gemini-2.5-flash-lite (highest free tier: 1000 RPD, 30 RPM).
+Includes retry logic with exponential backoff for rate limiting.
 """
 import json
 import random
 import logging
+import time
 
 import google.generativeai as genai
 
@@ -22,12 +22,76 @@ genai.configure(api_key=GEMINI_API_KEY)
 class ScriptWriter:
     """Generates AI-created Hindi story scripts via Gemini API."""
 
-    def __init__(self, model_name: str = "gemini-2.0-flash"):
+    def __init__(self, model_name: str = "gemini-2.5-flash-lite"):
         self.model = genai.GenerativeModel(model_name)
         self.generation_config = genai.GenerationConfig(
             temperature=0.9,
             top_p=0.95,
             max_output_tokens=8192,
+        )
+        self.max_retries = 5
+
+    def _generate_with_retry(self, prompt: str) -> str:
+        """
+        Call Gemini generate_content with retry logic.
+        Handles 429 (rate limit) and 503 (overloaded) errors
+        with exponential backoff.
+        """
+        last_error = None
+
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = self.model.generate_content(
+                    prompt,
+                    generation_config=self.generation_config,
+                )
+                return response.text
+
+            except Exception as e:
+                error_str = str(e)
+
+                # Rate limit (429) or overload (503)
+                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                    # Extract retry delay from error if available
+                    wait_time = 33  # default wait
+                    if "Please retry in" in error_str:
+                        try:
+                            # Try to extract the seconds from error message
+                            import re
+                            match = re.search(r'retry in (\d+\.?\d*)s', error_str)
+                            if match:
+                                wait_time = int(float(match.group(1))) + 2
+                        except Exception:
+                            pass
+
+                    # Exponential backoff: 33s, 66s, 132s, 264s, 528s
+                    wait_time = wait_time * (2 ** (attempt - 1))
+                    logger.warning(
+                        f"  Gemini rate limited (attempt {attempt}/{self.max_retries}), "
+                        f"waiting {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    last_error = e
+                    continue
+
+                elif "503" in error_str or "UNAVAILABLE" in error_str:
+                    wait_time = 10 * attempt
+                    logger.warning(
+                        f"  Gemini overloaded (attempt {attempt}/{self.max_retries}), "
+                        f"waiting {wait_time}s..."
+                    )
+                    time.sleep(wait_time)
+                    last_error = e
+                    continue
+
+                else:
+                    # Different error — re-raise
+                    logger.error(f"  Gemini API error: {error_str[:300]}")
+                    raise
+
+        raise RuntimeError(
+            f"Gemini API failed after {self.max_retries} retries. "
+            f"Last error: {last_error}"
         )
 
     # ── AI Topic Generation ─────────────────────────────────
@@ -40,14 +104,6 @@ class ScriptWriter:
         """
         Ask Gemini to generate unique story topics in Hindi that
         haven't been used before.
-
-        Args:
-            used_topics: List of topic titles already published
-            count: Number of new topics to generate
-            topic_type: "children" or "horror"
-
-        Returns:
-            List of dicts with 'title' and 'description' in Hindi
         """
         if topic_type == "children":
             genre_desc = (
@@ -61,7 +117,6 @@ class ScriptWriter:
                 "(कोई अत्यधिक हिंसा या खून नहीं)"
             )
 
-        # Build the "already used" list for Gemini to avoid
         used_list = "\n".join(f"  - {t}" for t in used_topics[-50:]) if used_topics else "  (कोई पिछली कहानी नहीं)"
 
         prompt = f"""तुम एक रचनात्मक कहानी लेखक हो। हिंदी में {count} नई, अद्वितीय 
@@ -87,21 +142,17 @@ class ScriptWriter:
   ]
 }}"""
 
-        response = self.model.generate_content(
-            prompt,
-            generation_config=self.generation_config,
-        )
+        logger.info(f"Gemini से {count} Hindi topics बनवाए जा रहे हैं...")
 
-        data = extract_json_from_response(response.text)
+        response_text = self._generate_with_retry(prompt)
+        data = extract_json_from_response(response_text)
 
         if data and "topics" in data:
             topics = data["topics"]
-            # Double-check none duplicate the used list
             unique = [
                 t for t in topics
                 if t.get("title", "") not in used_topics
             ]
-            # If Gemini accidentally repeated some, generate more
             if len(unique) < count:
                 logger.warning(
                     f"Gemini repeated {count - len(unique)} topics, "
@@ -177,9 +228,6 @@ JSON के पहले या बाद में कोई और text नह
     ) -> dict:
         """
         Generate a complete Hindi story script from an AI-created topic.
-        Args:
-            topic: dict with 'title' and 'description' (in Hindi)
-            topic_type: "children" or "horror"
         """
         topic_title = topic.get("title", "")
         topic_desc = topic.get("description", "")
@@ -187,20 +235,16 @@ JSON के पहले या बाद में कोई और text नह
         logger.info(f"हिंदी स्क्रिप्ट बन रही है: '{topic_title}' ({topic_type})")
 
         prompt = self._build_prompt(topic_title, topic_desc, topic_type)
-        response = self.model.generate_content(
-            prompt,
-            generation_config=self.generation_config,
-        )
 
-        script_data = extract_json_from_response(response.text)
+        response_text = self._generate_with_retry(prompt)
+        script_data = extract_json_from_response(response_text)
 
         if script_data is None:
             logger.error("स्क्रिप्ट JSON पार्स नहीं हुआ। दोबारा कोशिश...")
-            retry = self.model.generate_content(
-                "केवल valid JSON दो, कोई markdown नहीं। " + prompt,
-                generation_config=self.generation_config,
+            retry_text = self._generate_with_retry(
+                "केवल valid JSON दो, कोई markdown नहीं। " + prompt
             )
-            script_data = extract_json_from_response(retry.text)
+            script_data = extract_json_from_response(retry_text)
 
         if script_data is None:
             raise RuntimeError("स्क्रिप्ट बनाने में विफल")
@@ -213,7 +257,7 @@ JSON के पहले या बाद में कोई और text नह
             len(s.get("narration", "").split())
             for s in script_data.get("scenes", [])
         )
-        est_minutes = total_words / 120  # Hindi WPM
+        est_minutes = total_words / 120
 
         logger.info(
             f"स्क्रिप्ट तैयार: '{script_data.get('title')}' | "
