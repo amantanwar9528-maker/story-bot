@@ -57,6 +57,30 @@ class VideoEditor:
             return float(data.get("format", {}).get("duration", 0))
         return 0.0
 
+    def _is_valid_video(self, path: Optional[str]) -> bool:
+        """True only if the file exists, is non-trivial, and has duration."""
+        if not path or not os.path.exists(path) or os.path.getsize(path) < 1024:
+            return False
+        return self._get_duration(path) > 0.1
+
+    def _subtitle_filter(self, srt_path: Optional[str]) -> str:
+        """
+        Build the subtitles burn-in filter, but only if the SRT exists
+        and actually has content. An empty/missing SRT makes FFmpeg fail
+        with 'Invalid data found when processing input', so we skip it.
+        """
+        if (not srt_path or not os.path.exists(srt_path)
+                or os.path.getsize(srt_path) < 10):
+            return ""
+        escaped_srt = (
+            srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+        )
+        return (
+            f",subtitles='{escaped_srt}':force_style='FontName=Arial,"
+            f"FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
+            f"BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=40'"
+        )
+
     def _create_scene_clip_from_image(
         self,
         image_path: str,
@@ -105,34 +129,40 @@ class VideoEditor:
                 f"d={total_frames}:s={self.width}x{self.height}:fps={self.fps}"
             )
 
-        # Subtitle burn-in
-        subtitle_filter = ""
-        if os.path.exists(srt_path):
-            # Escape path for FFmpeg filter
-            escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            subtitle_filter = f",subtitles='{escaped_srt}':force_style='FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=40'"
+        # Subtitle burn-in (safe: empty/missing SRT is skipped)
+        subtitle_filter = self._subtitle_filter(srt_path)
 
-        # Build filter chain
-        vf = f"{zoom_filter}{subtitle_filter}"
+        def _build_and_run(sub: str):
+            vf = f"{zoom_filter}{sub}"
+            args = [
+                "-loop", "1", "-i", image_path,       # input: image
+                "-i", audio_path,                       # input: audio
+                "-filter_complex", f"[0:v]{vf}[v]",
+                "-map", "[v]",
+                "-map", "1:a",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-t", str(duration),
+                "-r", str(self.fps),
+                clip_path,
+            ]
+            self._run_ffmpeg(args, f"Scene {scene_index} clip creation")
 
-        args = [
-            "-loop", "1", "-i", image_path,       # input: image
-            "-i", audio_path,                       # input: audio
-            "-filter_complex", f"[0:v]{vf}[v]",
-            "-map", "[v]",
-            "-map", "1:a",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-t", str(duration),
-            "-r", str(self.fps),
-            clip_path,
-        ]
-
-        self._run_ffmpeg(args, f"Scene {scene_index} clip creation")
+        try:
+            _build_and_run(subtitle_filter)
+        except RuntimeError:
+            if subtitle_filter:
+                logger.warning(
+                    f"  Scene {scene_index}: subtitle burn-in failed, "
+                    f"retrying without subtitles"
+                )
+                _build_and_run("")
+            else:
+                raise
         return clip_path
 
     def _create_scene_clip_from_video(
@@ -145,40 +175,57 @@ class VideoEditor:
     ) -> str:
         """Create a video clip from a stock video with narration audio."""
         clip_path = os.path.join(job_dir, f"clip_{scene_index:03d}.mp4")
+
+        # Validate the stock video before handing it to FFmpeg. A corrupt
+        # or 0-byte download causes 'Invalid data found when processing
+        # input'; raising here lets the caller fall back to the image.
+        if not self._is_valid_video(video_path):
+            raise RuntimeError(
+                f"Invalid/empty stock video for scene {scene_index}: {video_path}"
+            )
+
         audio_duration = self._get_duration(audio_path)
         if audio_duration == 0:
             audio_duration = 10
 
-        # Subtitle filter
-        subtitle_filter = ""
-        if os.path.exists(srt_path):
-            escaped_srt = srt_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
-            subtitle_filter = f",subtitles='{escaped_srt}':force_style='FontName=Arial,FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=2,Shadow=1,Alignment=2,MarginV=40'"
+        # Subtitle filter (safe: empty/missing SRT is skipped)
+        subtitle_filter = self._subtitle_filter(srt_path)
 
-        vf = (
-            f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
-            f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:color=black"
-            f"{subtitle_filter}"
-        )
+        def _build_and_run(sub: str):
+            vf = (
+                f"scale={self.width}:{self.height}:force_original_aspect_ratio=decrease,"
+                f"pad={self.width}:{self.height}:(ow-iw)/2:(oh-ih)/2:color=black"
+                f"{sub}"
+            )
+            args = [
+                "-i", video_path,           # input: stock video
+                "-i", audio_path,            # input: narration audio
+                "-filter_complex", f"[0:v]{vf}[v]",
+                "-map", "[v]",
+                "-map", "1:a",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-t", str(audio_duration),
+                "-r", str(self.fps),
+                clip_path,
+            ]
+            self._run_ffmpeg(args, f"Scene {scene_index} video clip")
 
-        args = [
-            "-i", video_path,           # input: stock video
-            "-i", audio_path,            # input: narration audio
-            "-filter_complex", f"[0:v]{vf}[v]",
-            "-map", "[v]",
-            "-map", "1:a",
-            "-c:v", "libx264",
-            "-preset", "medium",
-            "-crf", "23",
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-t", str(audio_duration),
-            "-r", str(self.fps),
-            clip_path,
-        ]
-
-        self._run_ffmpeg(args, f"Scene {scene_index} video clip")
+        try:
+            _build_and_run(subtitle_filter)
+        except RuntimeError:
+            if subtitle_filter:
+                logger.warning(
+                    f"  Scene {scene_index}: subtitle burn-in failed, "
+                    f"retrying without subtitles"
+                )
+                _build_and_run("")
+            else:
+                raise
         return clip_path
 
     def _add_transition(
@@ -347,33 +394,51 @@ class VideoEditor:
         for i, (scene, assets) in enumerate(zip(scenes, scene_assets)):
             logger.info(f"Rendering scene {i + 1}/{len(scenes)}")
 
-            # Decide visual source: stock video if available, else image
-            stock_videos = assets.get("stock_videos", [])
+            # Only keep stock videos that are actually valid files.
+            stock_videos = [
+                v for v in assets.get("stock_videos", [])
+                if self._is_valid_video(v)
+            ]
             image_path = assets.get("image_path")
+            clip = None
 
+            # 1) Try stock video (if any valid one)
             if stock_videos:
-                clip = self._create_scene_clip_from_video(
-                    video_path=stock_videos[0],
-                    audio_path=assets["audio_path"],
-                    srt_path=assets["srt_path"],
-                    scene_index=i,
-                    job_dir=clips_dir,
-                )
-            elif image_path:
-                zoom_dir = zoom_directions[i % 3]
-                clip = self._create_scene_clip_from_image(
-                    image_path=image_path,
-                    audio_path=assets["audio_path"],
-                    srt_path=assets["srt_path"],
-                    scene_index=i,
-                    job_dir=clips_dir,
-                    zoom_direction=zoom_dir,
-                )
-            else:
-                logger.error(f"  Scene {i}: no visual source available!")
-                continue
+                try:
+                    clip = self._create_scene_clip_from_video(
+                        video_path=stock_videos[0],
+                        audio_path=assets["audio_path"],
+                        srt_path=assets["srt_path"],
+                        scene_index=i,
+                        job_dir=clips_dir,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"  Scene {i}: stock video failed ({e}); "
+                        f"falling back to image"
+                    )
+                    clip = None
 
-            clip_paths.append(clip)
+            # 2) Fall back to the cartoon image
+            if clip is None and image_path and os.path.exists(image_path):
+                zoom_dir = zoom_directions[i % 3]
+                try:
+                    clip = self._create_scene_clip_from_image(
+                        image_path=image_path,
+                        audio_path=assets["audio_path"],
+                        srt_path=assets["srt_path"],
+                        scene_index=i,
+                        job_dir=clips_dir,
+                        zoom_direction=zoom_dir,
+                    )
+                except Exception as e:
+                    logger.error(f"  Scene {i}: image clip failed ({e}); skipping scene")
+                    clip = None
+
+            if clip:
+                clip_paths.append(clip)
+            else:
+                logger.error(f"  Scene {i}: no usable clip, skipping")
 
         if not clip_paths:
             raise RuntimeError("No clips were created — cannot assemble video")
