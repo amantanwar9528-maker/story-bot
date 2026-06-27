@@ -14,7 +14,8 @@ from typing import Optional
 from PIL import Image, ImageDraw, ImageFont
 
 from config import (
-    GEMINI_API_KEY, GEMINI_IMAGE_MODEL, THUMB_WIDTH, THUMB_HEIGHT,
+    GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_IMAGE_MODEL,
+    THUMB_WIDTH, THUMB_HEIGHT,
     GHIBLI_STYLE, NEGATIVE_STYLE, VIDEO_WIDTH, VIDEO_HEIGHT,
 )
 from utils import logger, ensure_dir, sanitize_filename
@@ -27,32 +28,32 @@ class ThumbnailGenerator:
         self.model_id = model_id
         self.width = THUMB_WIDTH
         self.height = THUMB_HEIGHT
-        self.max_retries = 3
-        self.retry_delay = 6
-        self._client = None
+        self.retry_delay = 5
+        # Primary key first, then the separate fallback project key.
+        self.api_keys = [k for k in [GEMINI_API_KEY, GEMINI_API_KEY_2] if k]
+        self._clients = {}
 
-    def _get_client(self):
-        """Lazily create the google-genai client (needs GEMINI_API_KEY)."""
-        if self._client is not None:
-            return self._client
-        if not GEMINI_API_KEY:
-            logger.error("  GEMINI_API_KEY not set — cannot generate thumbnail")
-            return None
+    def _get_client(self, api_key: str):
+        """Lazily create (and cache) a google-genai client for a key."""
+        if api_key in self._clients:
+            return self._clients[api_key]
         try:
             from google import genai
-            self._client = genai.Client(api_key=GEMINI_API_KEY)
+            client = genai.Client(api_key=api_key)
+            self._clients[api_key] = client
+            return client
         except Exception as e:
             logger.error(f"  Failed to init Gemini client: {e}")
-            self._client = None
-        return self._client
+            return None
 
     def _query_api(self, prompt: str) -> Optional[bytes]:
         """
-        Generate a thumbnail image with Gemini.
-        Returns raw image bytes on success, None on failure.
+        Generate a thumbnail with Gemini. Tries the primary key first;
+        if it is rate-limited, switches to the fallback key IMMEDIATELY
+        (no waiting). Returns image bytes on success, None on failure.
         """
-        client = self._get_client()
-        if client is None:
+        if not self.api_keys:
+            logger.error("  No Gemini API key set — cannot generate thumbnail")
             return None
 
         try:
@@ -60,42 +61,58 @@ class ThumbnailGenerator:
         except Exception:
             types = None
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                logger.info(
-                    f"  Gemini thumbnail request "
-                    f"(attempt {attempt}/{self.max_retries}, model={self.model_id})"
-                )
-                kwargs = {"model": self.model_id, "contents": prompt}
-                if types is not None:
-                    try:
-                        kwargs["config"] = types.GenerateContentConfig(
-                            response_modalities=["IMAGE"],
-                            image_config=types.ImageConfig(aspect_ratio="16:9"),
+        for idx, api_key in enumerate(self.api_keys):
+            client = self._get_client(api_key)
+            if client is None:
+                continue
+            label = "primary" if idx == 0 else f"fallback#{idx}"
+
+            # Up to 2 attempts per key — but only for transient errors.
+            for attempt in range(1, 3):
+                try:
+                    logger.info(
+                        f"  Gemini thumbnail request ({label} key, "
+                        f"attempt {attempt}/2, model={self.model_id})"
+                    )
+                    kwargs = {"model": self.model_id, "contents": prompt}
+                    if types is not None:
+                        try:
+                            kwargs["config"] = types.GenerateContentConfig(
+                                response_modalities=["IMAGE"],
+                                image_config=types.ImageConfig(aspect_ratio="16:9"),
+                            )
+                        except Exception:
+                            pass  # older SDK: omit config, still returns an image
+
+                    response = client.models.generate_content(**kwargs)
+
+                    # Extract the first inline image part from the response
+                    for cand in getattr(response, "candidates", None) or []:
+                        content = getattr(cand, "content", None)
+                        for part in getattr(content, "parts", None) or []:
+                            inline = getattr(part, "inline_data", None)
+                            if inline and getattr(inline, "data", None):
+                                return inline.data
+
+                    logger.warning("  Gemini returned no image part")
+                    break  # no image from this key; try next key
+
+                except Exception as e:
+                    error_str = str(e)
+                    # Rate-limited → switch to next key right away, no wait
+                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                        logger.warning(
+                            f"  {label} key rate-limited — switching to next "
+                            f"key immediately (no wait)"
                         )
-                    except Exception:
-                        pass  # older SDK: omit config, still returns an image
+                        break
+                    logger.warning(
+                        f"  Gemini thumbnail error ({label}, "
+                        f"attempt {attempt}/2): {error_str[:200]}"
+                    )
+                    time.sleep(self.retry_delay)
 
-                response = client.models.generate_content(**kwargs)
-
-                # Extract the first inline image part from the response
-                for cand in getattr(response, "candidates", None) or []:
-                    content = getattr(cand, "content", None)
-                    for part in getattr(content, "parts", None) or []:
-                        inline = getattr(part, "inline_data", None)
-                        if inline and getattr(inline, "data", None):
-                            return inline.data
-
-                logger.warning("  Gemini returned no image part")
-
-            except Exception as e:
-                logger.warning(
-                    f"  Gemini thumbnail failed (attempt {attempt}): {e}"
-                )
-
-            time.sleep(self.retry_delay)
-
-        logger.error("  All retries exhausted for Gemini thumbnail")
+        logger.error("  All Gemini keys exhausted for thumbnail")
         return None
 
     def _add_title_overlay(

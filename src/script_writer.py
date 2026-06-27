@@ -11,9 +11,13 @@ import random
 import logging
 import time
 
+import requests
 import google.generativeai as genai
 
-from config import GEMINI_API_KEY, TARGET_WORD_COUNT, STORY_LANGUAGE_NAME
+from config import (
+    GEMINI_API_KEY, TARGET_WORD_COUNT, STORY_LANGUAGE_NAME,
+    GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL,
+)
 from utils import logger, extract_json_from_response, validate_content_safety
 
 genai.configure(api_key=GEMINI_API_KEY)
@@ -33,9 +37,12 @@ class ScriptWriter:
 
     def _generate_with_retry(self, prompt: str) -> str:
         """
-        Call Gemini generate_content with retry logic.
-        Handles 429 (rate limit) and 503 (overloaded) errors
-        with exponential backoff.
+        Generate text using Gemini, with an automatic free Groq fallback.
+
+        Gemini is tried first. If it is rate-limited (429 /
+        RESOURCE_EXHAUSTED), we do NOT sit and wait — we switch straight
+        to Groq so the pipeline never stalls. Only transient overloads
+        (503) get a short retry on Gemini.
         """
         last_error = None
 
@@ -49,50 +56,96 @@ class ScriptWriter:
 
             except Exception as e:
                 error_str = str(e)
+                last_error = e
 
-                # Rate limit (429) or overload (503)
+                # Rate limit / quota exhausted → go straight to Groq
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    # Extract retry delay from error if available
-                    wait_time = 33  # default wait
-                    if "Please retry in" in error_str:
-                        try:
-                            # Try to extract the seconds from error message
-                            import re
-                            match = re.search(r'retry in (\d+\.?\d*)s', error_str)
-                            if match:
-                                wait_time = int(float(match.group(1))) + 2
-                        except Exception:
-                            pass
-
-                    # Exponential backoff: 33s, 66s, 132s, 264s, 528s
-                    wait_time = wait_time * (2 ** (attempt - 1))
                     logger.warning(
-                        f"  Gemini rate limited (attempt {attempt}/{self.max_retries}), "
-                        f"waiting {wait_time}s..."
+                        "  Gemini rate-limited/quota exhausted — "
+                        "switching to free Groq fallback (no wait)"
                     )
-                    time.sleep(wait_time)
-                    last_error = e
-                    continue
+                    break
 
+                # Temporary overload → short retry, then fall back
                 elif "503" in error_str or "UNAVAILABLE" in error_str:
-                    wait_time = 10 * attempt
+                    wait_time = 5 * attempt
                     logger.warning(
                         f"  Gemini overloaded (attempt {attempt}/{self.max_retries}), "
                         f"waiting {wait_time}s..."
                     )
                     time.sleep(wait_time)
-                    last_error = e
                     continue
 
+                # Any other error → try Groq instead of crashing
                 else:
-                    # Different error — re-raise
                     logger.error(f"  Gemini API error: {error_str[:300]}")
-                    raise
+                    break
+
+        # ── Fallback: free Groq LLM ──
+        groq_text = self._generate_with_groq(prompt)
+        if groq_text:
+            return groq_text
 
         raise RuntimeError(
-            f"Gemini API failed after {self.max_retries} retries. "
-            f"Last error: {last_error}"
+            f"Both Gemini and Groq failed. Last Gemini error: {last_error}"
         )
+
+    def _generate_with_groq(self, prompt: str) -> str:
+        """
+        Free fallback: generate text via Groq (OpenAI-compatible API).
+        Returns the response text, or "" if unavailable.
+        """
+        if not GROQ_API_KEY:
+            logger.error("  GROQ_API_KEY not set — no fallback available")
+            return ""
+
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "तुम एक उस्ताद कहानीकार (master storyteller) हो जो "
+                        "केवल valid JSON में जवाब देता है, कोई extra text नहीं।"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.9,
+            "top_p": 0.95,
+            "max_tokens": 8192,
+        }
+
+        for attempt in range(1, 4):
+            try:
+                logger.info(
+                    f"  Groq fallback request "
+                    f"(model={GROQ_MODEL}, attempt {attempt}/3)"
+                )
+                r = requests.post(
+                    GROQ_BASE_URL, headers=headers, json=payload, timeout=180
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    return data["choices"][0]["message"]["content"]
+                elif r.status_code == 429:
+                    wait = 20 * attempt
+                    logger.warning(f"  Groq rate-limited, waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+                else:
+                    logger.error(f"  Groq error {r.status_code}: {r.text[:200]}")
+                    time.sleep(5)
+            except requests.RequestException as e:
+                logger.warning(f"  Groq request failed (attempt {attempt}): {e}")
+                time.sleep(5)
+
+        logger.error("  Groq fallback exhausted")
+        return ""
 
     # ── AI Topic Generation ─────────────────────────────────
     def generate_unique_topics(

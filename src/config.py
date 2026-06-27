@@ -9,9 +9,23 @@ load_dotenv()
 
 # ── API Keys ──────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Second Gemini key (different free project) — used for thumbnails so
+# image generation doesn't share/exhaust the script-writing quota.
+# When the primary key hits a rate limit, the thumbnail generator
+# switches to this one immediately (no waiting).
+GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "")
 HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+
+# ── Groq (FREE fallback LLM for script writing) ────────────
+# When Gemini is rate-limited, scripts are written by Groq instead,
+# so the bot never stalls. Free, no credit card: console.groq.com
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# llama-3.3-70b-versatile was deprecated (Jun 2026); gpt-oss-120b is
+# Groq's recommended replacement. Override via env if it changes again.
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ── Instagram ─────────────────────────────────────────────
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
