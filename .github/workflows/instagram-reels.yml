@@ -1,0 +1,106 @@
+# ════════════════════════════════════════════════════════════
+# STORY BOT — Instagram Reels (Time-Specific Posting)
+# Optional: Posts Instagram Reels at specific times to match
+# YouTube video premieres. Reads from published.json to find
+# videos published today and posts their promo reels.
+#
+# NOTE: The main pipeline already posts reels. Enable this only
+# if you want reels posted at exact times (7 AM, 1 PM, 6 PM IST)
+# instead of all at once during the early-morning generation run.
+# ════════════════════════════════════════════════════════════
+name: Instagram Reels Scheduler
+
+on:
+  schedule:
+    # 7 AM IST = 1:30 AM UTC
+    - cron: '30 1 * * *'
+    # 1 PM IST = 7:30 AM UTC
+    - cron: '30 7 * * *'
+    # 6 PM IST = 12:30 PM UTC
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+
+jobs:
+  post-reel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install instagrapi python-dotenv
+
+      - name: Restore Instagram session
+        uses: actions/cache@v4
+        with:
+          path: instagram_session.json
+          key: instagram-session-latest
+          restore-keys: |
+            instagram-session-
+
+      - name: Post scheduled Reel
+        env:
+          INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
+          INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
+        run: |
+          python -c "
+          import sys, json, os
+          from datetime import datetime
+
+          sys.path.insert(0, 'src')
+          from instagram_poster import InstagramPoster
+          from config import INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD
+
+          # Load published content
+          with open('data/published.json', 'r') as f:
+              published = json.load(f)
+
+          today = datetime.now().strftime('%Y-%m-%d')
+          today_videos = [p for p in published if p.get('date') == today]
+
+          if not today_videos:
+              print('No videos published today, skipping Reel post')
+              exit(0)
+
+          # Determine which slot to post based on current time
+          now_hour = datetime.now().hour
+          if now_hour < 10:
+              slot = 0
+          elif now_hour < 15:
+              slot = 1
+          else:
+              slot = 2
+
+          target = next((v for v in today_videos if v.get('slot') == slot), None)
+          if not target:
+              print(f'No video for slot {slot} today')
+              exit(0)
+
+          if target.get('reel_posted'):
+              print(f'Reel for slot {slot} already posted')
+              exit(0)
+
+          # Post the reel
+          poster = InstagramPoster(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+          caption = poster.generate_reel_caption(
+              story_title=target['video_title'],
+              youtube_url=target['youtube_url'],
+              topic_type=target['topic_type'],
+          )
+
+          # Note: This requires the reel video to be available.
+          # In the main pipeline, reels are posted immediately.
+          # This workflow is for time-specific posting if you
+          # modify the main pipeline to skip Instagram posting.
+          print(f'Time-specific Reel posting for: {target[\"video_title\"]}')
+          print('Enable this workflow only if the main pipeline skips Instagram.')
+          "

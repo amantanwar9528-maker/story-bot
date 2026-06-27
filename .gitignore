@@ -1,0 +1,37 @@
+# Environment & Secrets
+.env
+*.env
+client_secrets.json
+token.json
+*.credentials
+
+# Output (generated media)
+output/
+*.mp4
+*.mp3
+*.wav
+*.m4a
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.srt
+*.vtt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

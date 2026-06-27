@@ -1,0 +1,125 @@
+# ════════════════════════════════════════════════════════════
+# STORY BOT — Daily Video Generation & Upload Pipeline
+# Runs automatically every day, generates 3 story videos,
+# uploads to YouTube with scheduled publish times, and posts
+# Instagram Reel promos.
+# ════════════════════════════════════════════════════════════
+name: Daily Story Pipeline
+
+on:
+  schedule:
+    # 7 PM UTC = 12:30 AM IST (next day)
+    # Gives ~6.5 hours buffer before first upload at 7 AM IST
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+    inputs:
+      num_videos:
+        description: 'Number of videos to generate (1-3)'
+        required: false
+        default: '3'
+        type: choice
+        options: ['1', '2', '3']
+
+jobs:
+  generate-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ── Checkout ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Python ──
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── System Dependencies ──
+      - name: Install FFmpeg and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-noto-cjk
+
+      # ── Python Dependencies ──
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Optimize FFmpeg preset for CI speed ──
+      - name: Set FFmpeg to ultrafast preset for CI
+        run: |
+          sed -i 's/"medium"/"ultrafast"/g' src/video_editor.py
+          sed -i 's/"medium"/"ultrafast"/g' src/content_manager.py
+          echo "FFmpeg preset set to ultrafast for faster CI rendering"
+
+      # ── Restore Instagram session cache ──
+      - name: Restore Instagram session
+        uses: actions/cache@v4
+        with:
+          path: instagram_session.json
+          key: instagram-session-${{ github.run_id }}
+          restore-keys: |
+            instagram-session-
+
+      # ── Write YouTube credentials from secrets ──
+      - name: Write YouTube credentials
+        env:
+          YOUTUBE_CLIENT_SECRETS_B64: ${{ secrets.YOUTUBE_CLIENT_SECRETS_B64 }}
+          YOUTUBE_TOKEN_B64: ${{ secrets.YOUTUBE_TOKEN_B64 }}
+        run: |
+          if [ -z "$YOUTUBE_CLIENT_SECRETS_B64" ]; then
+            echo "WARNING: YOUTUBE_CLIENT_SECRETS_B64 not set"
+          else
+            echo "$YOUTUBE_CLIENT_SECRETS_B64" | base64 -d > client_secrets.json
+            echo "client_secrets.json written"
+          fi
+          if [ -z "$YOUTUBE_TOKEN_B64" ]; then
+            echo "WARNING: YOUTUBE_TOKEN_B64 not set"
+          else
+            echo "$YOUTUBE_TOKEN_B64" | base64 -d > token.json
+            echo "token.json written"
+          fi
+
+      # ── Run the pipeline ──
+      - name: Run daily pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HUGGINGFACE_API_KEY: ${{ secrets.HUGGINGFACE_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          INSTAGRAM_USERNAME: ${{ secrets.INSTAGRAM_USERNAME }}
+          INSTAGRAM_PASSWORD: ${{ secrets.INSTAGRAM_PASSWORD }}
+          TIMEZONE: ${{ secrets.TIMEZONE || 'Asia/Kolkata' }}
+        run: |
+          NUM_VIDEOS="${{ github.event.inputs.num_videos || '3' }}"
+          echo "Generating $NUM_VIDEOS videos..."
+          python -c "
+          import sys
+          sys.path.insert(0, 'src')
+          from content_manager import ContentManager
+          manager = ContentManager()
+          manager.run_daily_pipeline(num_videos=int('$NUM_VIDEOS'))
+          "
+
+      # ── Save Instagram session for next run ──
+      - name: Save Instagram session
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: instagram_session.json
+          key: instagram-session-${{ github.run_id }}
+
+      # ── Upload artifacts for debugging ──
+      - name: Upload output artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: story-bot-output-${{ github.run_id }}
+          path: |
+            output/
+            data/published.json
+          retention-days: 7
+          if-no-files-found: ignore

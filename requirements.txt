@@ -1,0 +1,23 @@
+# ═══ Text-to-Speech ═══
+edge-tts>=6.1.0
+aiohttp>=3.9.0
+
+# ═══ Video Editing ═══
+moviepy>=2.0.0
+ffmpeg-python>=0.2.0
+Pillow>=10.0.0
+
+# ═══ AI / Script Writing ═══
+google-generativeai>=0.7.0
+requests>=2.31.0
+
+# ═══ YouTube Upload ═══
+google-api-python-client>=2.100.0
+google-auth-oauthlib>=1.1.0
+google-auth-httplib2>=0.2.0
+
+# ═══ Instagram ═══
+instagrapi>=2.0.0
+
+# ═══ Utilities ═══
+python-dotenv>=1.0.0
