@@ -46,40 +46,60 @@ class ScriptWriter:
         """
         last_error = None
 
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                response = self.model.generate_content(
-                    prompt,
-                    generation_config=self.generation_config,
-                )
-                return response.text
-
-            except Exception as e:
-                error_str = str(e)
-                last_error = e
-
-                # Rate limit / quota exhausted → go straight to Groq
-                if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    logger.warning(
-                        "  Gemini rate-limited/quota exhausted — "
-                        "switching to free Groq fallback (no wait)"
+        # No key (or obviously wrong) → don't bother hitting Gemini,
+        # which would throw a confusing OAuth error. Go straight to Groq.
+        if not GEMINI_API_KEY:
+            logger.warning(
+                "  GEMINI_API_KEY not set — skipping Gemini, using Groq"
+            )
+        else:
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    response = self.model.generate_content(
+                        prompt,
+                        generation_config=self.generation_config,
                     )
-                    break
+                    return response.text
 
-                # Temporary overload → short retry, then fall back
-                elif "503" in error_str or "UNAVAILABLE" in error_str:
-                    wait_time = 5 * attempt
-                    logger.warning(
-                        f"  Gemini overloaded (attempt {attempt}/{self.max_retries}), "
-                        f"waiting {wait_time}s..."
-                    )
-                    time.sleep(wait_time)
-                    continue
+                except Exception as e:
+                    error_str = str(e)
+                    last_error = e
 
-                # Any other error → try Groq instead of crashing
-                else:
-                    logger.error(f"  Gemini API error: {error_str[:300]}")
-                    break
+                    # Rate limit / quota exhausted → go straight to Groq
+                    if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                        logger.warning(
+                            "  Gemini rate-limited/quota exhausted — "
+                            "switching to free Groq fallback (no wait)"
+                        )
+                        break
+
+                    # Auth/key problem → clear message, then Groq
+                    elif any(k in error_str for k in (
+                        "401", "403", "UNAUTHENTICATED", "PERMISSION_DENIED",
+                        "ACCESS_TOKEN_TYPE_UNSUPPORTED", "API_KEY_INVALID",
+                        "API key not valid",
+                    )):
+                        logger.error(
+                            "  Gemini AUTH failed — check the GEMINI_API_KEY "
+                            "secret (a valid key starts with 'AIza'). "
+                            "Falling back to Groq."
+                        )
+                        break
+
+                    # Temporary overload → short retry, then fall back
+                    elif "503" in error_str or "UNAVAILABLE" in error_str:
+                        wait_time = 5 * attempt
+                        logger.warning(
+                            f"  Gemini overloaded (attempt {attempt}/{self.max_retries}), "
+                            f"waiting {wait_time}s..."
+                        )
+                        time.sleep(wait_time)
+                        continue
+
+                    # Any other error → try Groq instead of crashing
+                    else:
+                        logger.error(f"  Gemini API error: {error_str[:300]}")
+                        break
 
         # ── Fallback: free Groq LLM ──
         groq_text = self._generate_with_groq(prompt)
@@ -90,10 +110,17 @@ class ScriptWriter:
             f"Both Gemini and Groq failed. Last Gemini error: {last_error}"
         )
 
-    def _generate_with_groq(self, prompt: str) -> str:
+    def _generate_with_groq(self, prompt: str, max_tokens: int = 4096) -> str:
         """
         Free fallback: generate text via Groq (OpenAI-compatible API).
-        Returns the response text, or "" if unavailable.
+
+        Groq's free tier has a low tokens-per-minute (TPM) cap, so if the
+        request is too large (HTTP 413) we automatically shrink max_tokens
+        and retry. Returns the response text, or "" if unavailable.
+
+        Note: a full ~45-min script may exceed the free TPM cap; Groq is an
+        emergency fallback to keep the bot alive — the main script engine is
+        Gemini. Keep your GEMINI_API_KEY working for full-length scripts.
         """
         if not GROQ_API_KEY:
             logger.error("  GROQ_API_KEY not set — no fallback available")
@@ -103,28 +130,28 @@ class ScriptWriter:
             "Authorization": f"Bearer {GROQ_API_KEY}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": GROQ_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "तुम एक उस्ताद कहानीकार (master storyteller) हो जो "
-                        "केवल valid JSON में जवाब देता है, कोई extra text नहीं।"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.9,
-            "top_p": 0.95,
-            "max_tokens": 8192,
-        }
 
-        for attempt in range(1, 4):
+        for attempt in range(1, 6):
+            payload = {
+                "model": GROQ_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "तुम एक उस्ताद कहानीकार (master storyteller) हो जो "
+                            "केवल valid JSON में जवाब देता है, कोई extra text नहीं।"
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.9,
+                "top_p": 0.95,
+                "max_tokens": max_tokens,
+            }
             try:
                 logger.info(
                     f"  Groq fallback request "
-                    f"(model={GROQ_MODEL}, attempt {attempt}/3)"
+                    f"(model={GROQ_MODEL}, max_tokens={max_tokens}, attempt {attempt})"
                 )
                 r = requests.post(
                     GROQ_BASE_URL, headers=headers, json=payload, timeout=180
@@ -132,6 +159,19 @@ class ScriptWriter:
                 if r.status_code == 200:
                     data = r.json()
                     return data["choices"][0]["message"]["content"]
+
+                # Request too large for free TPM cap → shrink and retry
+                elif r.status_code == 413:
+                    new_max = max(1024, max_tokens // 2)
+                    logger.warning(
+                        f"  Groq request too large (TPM cap) — reducing "
+                        f"max_tokens {max_tokens} → {new_max}"
+                    )
+                    if new_max == max_tokens:
+                        break
+                    max_tokens = new_max
+                    continue
+
                 elif r.status_code == 429:
                     wait = 20 * attempt
                     logger.warning(f"  Groq rate-limited, waiting {wait}s...")
